@@ -1,0 +1,381 @@
+"""
+proof of concept: whisper rescoring with shallow fusion
+demonstrates: whisper transcription → confidence detection → phonetic matching → lm rescoring
+"""
+
+import torch
+import whisper
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from metaphone import doublemetaphone
+import jellyfish
+import numpy as np
+
+# ============================================
+# setup
+# ============================================
+print("loading models...")
+
+# load whisper mini
+whisper_model = whisper.load_model("tiny")
+print("✓ whisper loaded")
+
+# load gpt-2 for rescoring
+device = "cuda" if torch.cuda.is_available() else "cpu"
+lm_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+lm_model = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
+lm_model.eval()
+print(f"✓ gpt-2 loaded on {device}")
+
+# ============================================
+# configuration
+# ============================================
+CONFIDENCE_THRESHOLD = 0.7  # rescore words below this confidence
+PHONETIC_THRESHOLD = 0.50   # minimum phonetic similarity
+LAMBDA = 0.4               # weight for lm in shallow fusion
+MIN_IMPROVEMENT = 0.1      # minimum score improvement to replace
+
+# hot words list (domain vocabulary)
+HOT_WORDS = [
+    "eigenvalue", "eigenvector", "matrix", "determinant",
+    "gaussian", "probability", "statistics", "variance",
+    "mitochondria", "photosynthesis", "ribosome",
+    "derivative", "integral", "theorem", "polynomial",
+    "algorithm", "recursion", "iteration", "complexity"
+]
+
+print(f"✓ loaded {len(HOT_WORDS)} hot words\n")
+
+# ============================================
+# helper functions
+# ============================================
+
+def get_phonetic_similarity(word1, word2):
+    """calculate phonetic similarity between two words (0-1 scale)"""
+    code1 = doublemetaphone(word1.lower())[0]
+    code2 = doublemetaphone(word2.lower())[0]
+    
+    if not code1 or not code2:
+        return 0.0
+    
+    if code1 == code2:
+        return 1.0
+    
+    max_len = max(len(code1), len(code2))
+    if max_len == 0:
+        return 0.0
+    
+    edit_dist = jellyfish.levenshtein_distance(code1, code2)
+    similarity = 1 - (edit_dist / max_len)
+    return similarity
+
+def find_phonetic_matches(word, hot_words, threshold=PHONETIC_THRESHOLD):
+    """find hot words that sound similar to the given word"""
+    matches = []
+    for hot_word in hot_words:
+        similarity = get_phonetic_similarity(word, hot_word)
+        if similarity >= threshold:
+            matches.append((hot_word, similarity))
+    
+    # sort by similarity (best first)
+    matches.sort(key=lambda x: x[1], reverse=True)
+    return matches
+
+def score_with_lm(text):
+    """get log probability of text from language model"""
+    tokens = lm_tokenizer.encode(text, return_tensors="pt").to(device)
+    
+    with torch.no_grad():
+        outputs = lm_model(tokens, labels=tokens)
+        # convert loss to log probability
+        log_prob = -outputs.loss.item()
+    
+    return log_prob
+
+def rescore_word_in_context(word, confidence, context_before, context_after, hot_words):
+    """
+    rescore a single word using shallow fusion
+    returns: (best_word, explanation_dict)
+    """
+    
+    # step 1: check if confidence is low enough to rescore
+    if confidence >= CONFIDENCE_THRESHOLD:
+        return word, {
+            "action": "kept_original",
+            "reason": f"confidence {confidence:.2f} above threshold {CONFIDENCE_THRESHOLD}"
+        }
+    
+    # step 2: find phonetically similar hot words
+    candidates = find_phonetic_matches(word, hot_words)
+    
+    if not candidates:
+        return word, {
+            "action": "kept_original",
+            "reason": f"no phonetically similar hot words (threshold {PHONETIC_THRESHOLD})",
+            "word_phonetic_code": doublemetaphone(word)[0]
+        }
+    
+    # step 3: score original and candidates with lm
+    original_context = f"{context_before} {word} {context_after}"
+    original_lm_score = score_with_lm(original_context)
+    
+    # shallow fusion: combine whisper confidence + lm score
+    original_combined = np.log(max(confidence, 0.01)) + LAMBDA * original_lm_score
+    
+    # score each candidate
+    candidate_scores = {}
+    for candidate, phon_sim in candidates:
+        candidate_context = f"{context_before} {candidate} {context_after}"
+        candidate_lm_score = score_with_lm(candidate_context)
+        
+        # shallow fusion formula
+        combined_score = np.log(max(confidence, 0.01)) + LAMBDA * candidate_lm_score
+        
+        candidate_scores[candidate] = {
+            "phonetic_similarity": phon_sim,
+            "lm_score": candidate_lm_score,
+            "combined_score": combined_score
+        }
+    
+    # step 4: find best candidate
+    best_candidate = max(candidate_scores.keys(), 
+                        key=lambda c: candidate_scores[c]["combined_score"])
+    best_score = candidate_scores[best_candidate]["combined_score"]
+    
+    # step 5: decide whether to replace
+    improvement = best_score - original_combined
+    
+    if improvement > MIN_IMPROVEMENT:
+        return best_candidate, {
+            "action": "replaced",
+            "original": word,
+            "replacement": best_candidate,
+            "whisper_confidence": confidence,
+            "original_combined_score": original_combined,
+            "best_combined_score": best_score,
+            "improvement": improvement,
+            "candidates_considered": len(candidates),
+            "top_candidates": candidate_scores
+        }
+    else:
+        return word, {
+            "action": "kept_original",
+            "reason": f"improvement {improvement:.2f} below threshold {MIN_IMPROVEMENT}",
+            "best_alternative": best_candidate,
+            "best_alternative_improvement": improvement,
+            "candidates_considered": len(candidates)
+        }
+
+# ============================================
+# main rescoring pipeline
+# ============================================
+
+def rescore_transcript(transcript_result, hot_words):
+    """
+    rescore whisper transcript using shallow fusion
+    
+    args:
+        transcript_result: whisper transcription result with word timestamps
+        hot_words: list of domain-specific vocabulary
+    
+    returns:
+        rescored_text, detailed_log
+    """
+    
+    words = []
+    log = []
+    
+    # extract words with confidence scores
+    for segment in transcript_result["segments"]:
+        if "words" not in segment:
+            continue
+            
+        for word_info in segment["words"]:
+            word = word_info["word"].strip()
+            confidence = word_info.get("probability", 1.0)
+            
+            words.append({
+                "word": word,
+                "confidence": confidence,
+                "start": word_info.get("start", 0),
+                "end": word_info.get("end", 0)
+            })
+    
+    # rescore each word with context
+    rescored_words = []
+    
+    for i, word_data in enumerate(words):
+        word = word_data["word"]
+        confidence = word_data["confidence"]
+        
+        # get context (5 words before and after)
+        context_before = " ".join([w["word"] for w in words[max(0, i-5):i]])
+        context_after = " ".join([w["word"] for w in words[i+1:min(len(words), i+6)]])
+        
+        # rescore
+        best_word, explanation = rescore_word_in_context(
+            word, confidence, context_before, context_after, hot_words
+        )
+        
+        rescored_words.append(best_word)
+        
+        # always log low-confidence words (whether replaced or not)
+        if confidence < CONFIDENCE_THRESHOLD:
+            log.append({
+                "position": i,
+                "word_data": word_data,
+                "context_before": context_before,
+                "context_after": context_after,
+                "explanation": explanation
+            })
+    
+    rescored_text = " ".join(rescored_words)
+    
+    return rescored_text, log
+
+# ============================================
+# demo / test
+# ============================================
+
+def demo():
+    """demonstrate the rescoring system"""
+    
+    print("=" * 60)
+    print("whisper + gpt-2 rescoring demonstration")
+    print("=" * 60)
+    
+    print("\n1. simulating whisper transcription with errors...")
+    
+    # FIXED: realistic mishearings as single words
+    mock_transcript = {
+        "segments": [{
+            "words": [
+                {"word": "the", "probability": 0.95, "start": 0.0, "end": 0.2},
+                {"word": "icon", "probability": 0.52, "start": 0.2, "end": 0.6},     # should be "eigenvalue" 
+                {"word": "value", "probability": 0.48, "start": 0.6, "end": 0.9},    # or mishears as two words
+                {"word": "of", "probability": 0.92, "start": 0.9, "end": 1.1},
+                {"word": "the", "probability": 0.93, "start": 1.1, "end": 1.3},
+                {"word": "matrix", "probability": 0.88, "start": 1.3, "end": 1.7},
+                {"word": "is", "probability": 0.91, "start": 1.7, "end": 1.9},
+                {"word": "goshen", "probability": 0.48, "start": 1.9, "end": 2.3},   # should be "gaussian"
+            ]
+        }]
+    }
+    
+    # construct original text
+    original_text = " ".join([w["word"] for seg in mock_transcript["segments"] 
+                             for w in seg["words"]])
+    print(f"\noriginal whisper output:\n  '{original_text}'")
+    
+    # show low-confidence words
+    print(f"\nlow-confidence words detected (threshold: {CONFIDENCE_THRESHOLD}):")
+    for seg in mock_transcript["segments"]:
+        for w in seg["words"]:
+            if w["probability"] < CONFIDENCE_THRESHOLD:
+                phon = doublemetaphone(w["word"])[0]
+                print(f"  - '{w['word']}' (confidence: {w['probability']:.2f}, phonetic: {phon})")
+    
+    # show what phonetic matches exist
+    print(f"\nphonetic matching test:")
+    for seg in mock_transcript["segments"]:
+        for w in seg["words"]:
+            if w["probability"] < CONFIDENCE_THRESHOLD:
+                matches = find_phonetic_matches(w["word"], HOT_WORDS)
+                if matches:
+                    print(f"  '{w['word']}' → {[(m[0], f'{m[1]:.2f}') for m in matches[:3]]}")
+                else:
+                    print(f"  '{w['word']}' → no matches found")
+    
+    # run rescoring
+    print("\n2. running rescoring with shallow fusion...")
+    rescored_text, log = rescore_transcript(mock_transcript, HOT_WORDS)
+    
+    print(f"\nrescored output:\n  '{rescored_text}'")
+    
+    # show detailed log
+    print("\n3. rescoring decisions:")
+    print("-" * 60)
+    
+    if not log:
+        print("no low-confidence words found")
+    else:
+        for entry in log:
+            exp = entry["explanation"]
+            print(f"\nposition: {entry['position']}")
+            print(f"word: '{entry['word_data']['word']}' (confidence: {entry['word_data']['confidence']:.2f})")
+            print(f"action: {exp['action']}")
+            
+            if exp["action"] == "replaced":
+                print(f"  original: '{exp['original']}'")
+                print(f"  replaced with: '{exp['replacement']}'")
+                print(f"  improvement: {exp['improvement']:.3f}")
+                print(f"  phonetic similarity: {exp['top_candidates'][exp['replacement']]['phonetic_similarity']:.2f}")
+                print(f"  lm score improvement: {exp['top_candidates'][exp['replacement']]['lm_score']:.3f}")
+            else:
+                print(f"  reason: {exp['reason']}")
+                if 'best_alternative' in exp:
+                    print(f"  best alternative was: '{exp['best_alternative']}' (improvement: {exp.get('best_alternative_improvement', 0):.3f})")
+            
+            print(f"  context: ...{entry['context_before']} [{entry['word_data']['word']}] {entry['context_after']}...")
+    
+    print("\n" + "=" * 60)
+    print("demonstration complete")
+    print("=" * 60)
+
+# ============================================
+# run with real audio (optional)
+# ============================================
+
+def transcribe_and_rescore(audio_path, hot_words=HOT_WORDS):
+    """
+    transcribe audio file and apply rescoring
+    
+    args:
+        audio_path: path to audio file
+        hot_words: domain vocabulary list
+    
+    returns:
+        original_text, rescored_text, log
+    """
+    
+    print(f"transcribing audio: {audio_path}")
+    
+    # transcribe with word-level timestamps
+    result = whisper_model.transcribe(
+        audio_path,
+        word_timestamps=True,
+        verbose=False
+    )
+    
+    original_text = result["text"]
+    print(f"\noriginal: {original_text}")
+    
+    # rescore
+    rescored_text, log = rescore_transcript(result, hot_words)
+    print(f"rescored: {rescored_text}")
+    
+    # show changes
+    if log:
+        print(f"\n{len(log)} words analyzed:")
+        replaced = [e for e in log if e["explanation"]["action"] == "replaced"]
+        if replaced:
+            print(f"{len(replaced)} words rescored:")
+            for entry in replaced:
+                exp = entry["explanation"]
+                print(f"  '{exp['original']}' → '{exp['replacement']}'")
+        else:
+            print("no words met replacement criteria")
+    else:
+        print("\nno low-confidence words found")
+    
+    return original_text, rescored_text, log
+
+# ============================================
+# run demonstration
+# ============================================
+
+if __name__ == "__main__":
+    # run demo with synthetic data
+    demo()
+    
+    # to test with real audio file, uncomment:
+    # transcribe_and_rescore("path/to/your/audio.mp3")
