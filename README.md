@@ -8,20 +8,22 @@ The code listens to audio in chunks and transcribes them via Whisper. If Whisper
 2. Uses GPT-2 to check if a candidate hotword actually makes sense in the current sentence.
 3. Swaps the word if the combined confidence (ASR + LM) is higher.
 
-## Setup
+## Web UI (Recommended)
+You can now use the Streamlit interface to upload notes and audio dynamically:
 1. Install dependencies:
    ```bash
-   pip install sounddevice openai-whisper transformers jellyfish Metaphone numpy torch
+   pip install sounddevice openai-whisper transformers jellyfish Metaphone numpy torch keybert streamlit pypdf2 sentence-transformers
    ```
-2. Put whatever jargon you need in `hotwords.txt`.
-3. Run the live listener:
+2. Run the app:
    ```bash
-   python3 main.py
+   streamlit run app.py
    ```
 
 ## Files
-- `main.py`: Entry point for the live audio stream.
-- `fusion_processor.py`: The actual rescoring logic.
+- `app.py`: Streamlit web dashboard.
+- `keyword_extractor.py`: BERT-based hotword extraction from PDF/TXT.
+- `fusion_processor.py`: The modular rescoring logic.
 - `phonetic_matcher.py`: Metaphone + Levenshtein fuzzy matching.
-- `asr_engine.py` / `lm_rescorer.py`: Model wrappers for Whisper and GPT-2.
-- `test_fusion.py`: Quick script to verify rescoring logic without needing a mic.
+- `asr_engine.py` / `lm_rescorer.py`: Model wrappers for Whisper and GPT-2/BERT.
+- `test_fusion.py`: Quick verification script.
+

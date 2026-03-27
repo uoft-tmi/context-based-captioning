@@ -1,0 +1,22 @@
+# Evaluation Suite Configuration
+
+paths:
+  audio_dir: "tests/audio"
+  ground_truth_dir: "tests/ground_truth"
+  results_dir: "tests/results"
+  plots_dir: "tests/results/plots"
+  hotwords_file: "hotwords.txt"
+
+models:
+  whisper: "base"      # tiny, base, small, medium, large-v3
+  llm: "gpt2"          # gpt2, distilgpt2
+  bert: "all-MiniLM-L6-v2"
+
+thresholds:
+  confidence: 0.7      # ASR confidence below which rescoring triggers
+  phonetic: 0.35       # Phonetic similarity threshold (0-1)
+  lambda_lm: 1.0       # Weight for language model score
+
+evaluation:
+  detect_regression: true
+  regression_threshold_wer_increase: 5.0 # percentage points

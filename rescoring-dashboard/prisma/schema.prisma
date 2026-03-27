@@ -1,0 +1,72 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-1.0.x"]
+}
+   
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Decision {
+  id                         Int      @id @default(autoincrement())
+  timestamp                  DateTime @default(now())
+  session_id                 String
+  audio_file                 String
+  position                   Int
+  original_word              String
+  whisper_confidence         Float
+  action                     String
+  replacement_word           String?
+  phonetic_similarity        Float
+  lm_score_original          Float
+  lm_score_replacement       Float
+  combined_score_original    Float
+  combined_score_replacement Float
+  improvement                Float
+  context_before             String
+  context_after              String
+  domain                     String
+  speaker                    String
+  audio_quality              String
+  user_approved              Boolean?
+  user_feedback              String?
+  flagged                    Boolean  @default(false)
+
+  @@index([session_id])
+  @@index([timestamp])
+}
+
+model Parameter {
+  session_id           String @id
+  confidence_threshold Float
+  phonetic_threshold   Float
+  lambda               Float
+  min_improvement      Float
+  hot_words            String // JSON string
+  whisper_model        String
+  lm_model             String
+}
+
+model Session {
+  session_id           String   @id
+  timestamp            DateTime @default(now())
+  audio_file           String
+  total_words          Int
+  low_confidence_words Int
+  words_rescored       Int
+  wer_before           Float
+  wer_after            Float
+  processing_time      Float
+}
+
+model Incident {
+  id            Int      @id @default(autoincrement())
+  timestamp     DateTime @default(now())
+  decision_id   Int
+  incident_type String
+  severity      String
+  description   String
+  resolved      Boolean  @default(false)
+}

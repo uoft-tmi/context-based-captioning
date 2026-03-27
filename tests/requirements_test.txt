@@ -1,0 +1,5 @@
+pytest
+jiwer
+psutil
+pytest-mock
+pytest-cov

@@ -1,0 +1,2 @@
+filename,duration_total_s,latency_rescore_s,latency_per_word_s,throughput_wps,peak_memory_mb,words_total,words_rescored,wer_before,wer_after,wer_improvement,precision,recall,f1,tp,fp,fn
+sample_lecture.wav,8.821487426757812e-06,3.0994415283203125e-06,0.01,100,50.0,6,1,0.2,0.0,0.2,1.0,1.0,1.0,1,0,0
